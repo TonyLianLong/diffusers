@@ -31,7 +31,7 @@ from .attention_processor import (
     AttnAddedKVProcessor,
     AttnProcessor,
 )
-from .embeddings import TimestepEmbedding, Timesteps
+from .embeddings import TimestepEmbedding, Timesteps, PositionNet
 from .modeling_utils import ModelMixin
 from .transformer_temporal import TransformerTemporalModel
 from .unet_3d_blocks import (
@@ -122,6 +122,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         cross_attention_dim: int = 1024,
         attention_head_dim: Union[int, Tuple[int]] = 64,
         num_attention_heads: Optional[Union[int, Tuple[int]]] = None,
+        attention_type: str = "default",
     ):
         super().__init__()
 
@@ -211,6 +212,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 num_attention_heads=num_attention_heads[i],
                 downsample_padding=downsample_padding,
                 dual_cross_attention=False,
+                attention_type=attention_type,
             )
             self.down_blocks.append(down_block)
 
@@ -225,6 +227,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             num_attention_heads=num_attention_heads[-1],
             resnet_groups=norm_num_groups,
             dual_cross_attention=False,
+            attention_type=attention_type,
         )
 
         # count how many layers upsample the images
@@ -264,6 +267,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 num_attention_heads=reversed_num_attention_heads[i],
                 dual_cross_attention=False,
                 resolution_idx=i,
+                attention_type=attention_type,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -282,6 +286,18 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         self.conv_out = nn.Conv2d(
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
         )
+        
+        if attention_type in ["gated", "gated-text-image"]:
+            positive_len = 768
+            if isinstance(cross_attention_dim, int):
+                positive_len = cross_attention_dim
+            elif isinstance(cross_attention_dim, tuple) or isinstance(cross_attention_dim, list):
+                positive_len = cross_attention_dim[0]
+
+            feature_type = "text-only" if attention_type == "gated" else "text-image"
+            self.position_net = PositionNet(
+                positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
+            )
 
     @property
     # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.attn_processors
@@ -523,7 +539,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         Args:
             sample (`torch.FloatTensor`):
-                The noisy input tensor with the following shape `(batch, num_frames, channel, height, width`.
+                The noisy input tensor with the following shape `(batch, channel, num_frames, height, width`.
             timestep (`torch.FloatTensor` or `float` or `int`): The number of timesteps to denoise an input.
             encoder_hidden_states (`torch.FloatTensor`):
                 The encoder hidden states with shape `(batch, sequence_length, feature_dim)`.
@@ -613,6 +629,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             cross_attention_kwargs=cross_attention_kwargs,
             return_dict=False,
         )[0]
+
+        # 2.5 GLIGEN position net
+        if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
+            cross_attention_kwargs = cross_attention_kwargs.copy()
+            gligen_args = cross_attention_kwargs.pop("gligen")
+            cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
 
         # 3. down
         down_block_res_samples = (sample,)

@@ -56,6 +56,7 @@ def get_down_block(
     temporal_num_attention_heads: int = 8,
     temporal_max_seq_length: int = 32,
     transformer_layers_per_block: int = 1,
+    attention_type: str = "default",
 ) -> Union[
     "DownBlock3D",
     "CrossAttnDownBlock3D",
@@ -97,6 +98,7 @@ def get_down_block(
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            attention_type=attention_type,
         )
     if down_block_type == "DownBlockMotion":
         return DownBlockMotion(
@@ -182,6 +184,7 @@ def get_up_block(
     only_cross_attention: bool = False,
     upcast_attention: bool = False,
     resnet_time_scale_shift: str = "default",
+    attention_type: str = "default",
     temporal_num_attention_heads: int = 8,
     temporal_cross_attention_dim: Optional[int] = None,
     temporal_max_seq_length: int = 32,
@@ -230,6 +233,7 @@ def get_up_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             resolution_idx=resolution_idx,
+            attention_type=attention_type,
         )
     if up_block_type == "UpBlockMotion":
         return UpBlockMotion(
@@ -320,6 +324,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         dual_cross_attention: bool = False,
         use_linear_projection: bool = True,
         upcast_attention: bool = False,
+        attention_type: str = "default",
     ):
         super().__init__()
 
@@ -364,6 +369,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                     norm_num_groups=resnet_groups,
                     use_linear_projection=use_linear_projection,
                     upcast_attention=upcast_attention,
+                    attention_type=attention_type,
                 )
             )
             temp_attentions.append(
@@ -458,6 +464,7 @@ class CrossAttnDownBlock3D(nn.Module):
         use_linear_projection: bool = False,
         only_cross_attention: bool = False,
         upcast_attention: bool = False,
+        attention_type: str = "default",
     ):
         super().__init__()
         resnets = []
@@ -503,6 +510,7 @@ class CrossAttnDownBlock3D(nn.Module):
                     use_linear_projection=use_linear_projection,
                     only_cross_attention=only_cross_attention,
                     upcast_attention=upcast_attention,
+                    attention_type=attention_type,
                 )
             )
             temp_attentions.append(
@@ -689,6 +697,7 @@ class CrossAttnUpBlock3D(nn.Module):
         use_linear_projection: bool = False,
         only_cross_attention: bool = False,
         upcast_attention: bool = False,
+        attention_type: str = "default",
         resolution_idx: Optional[int] = None,
     ):
         super().__init__()
@@ -737,6 +746,7 @@ class CrossAttnUpBlock3D(nn.Module):
                     use_linear_projection=use_linear_projection,
                     only_cross_attention=only_cross_attention,
                     upcast_attention=upcast_attention,
+                    attention_type=attention_type,
                 )
             )
             temp_attentions.append(

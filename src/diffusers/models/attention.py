@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Any, Dict, Optional
-
+import warnings
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -267,6 +267,8 @@ class BasicTransformerBlock(nn.Module):
         # 4. Fuser
         if attention_type == "gated" or attention_type == "gated-text-image":
             self.fuser = GatedSelfAttentionDense(dim, cross_attention_dim, num_attention_heads, attention_head_dim)
+        else:
+            self.fuser = None
 
         # 5. Scale-shift for PixArt-Alpha.
         if self.use_ada_layer_norm_single:
@@ -343,7 +345,10 @@ class BasicTransformerBlock(nn.Module):
 
         # 2.5 GLIGEN Control
         if gligen_kwargs is not None:
-            hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+            if self.fuser is not None:
+                hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+            else:
+                warnings.warn("gligen_kwargs supplied but the attention is not gated (no fuser). Ignoring gligen_kwargs. This is typical in temporal blocks.")
 
         # 3. Cross-Attention
         if self.attn2 is not None:

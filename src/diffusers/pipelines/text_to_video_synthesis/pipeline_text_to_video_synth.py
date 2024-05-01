@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -21,6 +22,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 from ...loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, UNet3DConditionModel
+from ...models.attention import GatedSelfAttentionDense
 from ...models.lora import adjust_lora_scale_text_encoder
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
@@ -419,9 +421,12 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
         height,
         width,
         callback_steps,
+        gligen_phrases,
+        gligen_boxes,
         negative_prompt=None,
         prompt_embeds=None,
         negative_prompt_embeds=None,
+        num_frames=None,
         callback_on_step_end_tensor_inputs=None,
     ):
         if height % 8 != 0 or width % 8 != 0:
@@ -464,6 +469,20 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
                     f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
                     f" {negative_prompt_embeds.shape}."
                 )
+                
+        if gligen_boxes:
+            if len(gligen_phrases) != num_frames or len(gligen_boxes) != num_frames:
+                raise ValueError(
+                    "length of `gligen_phrases` and `gligen_boxes` has to be same and match `num_frames`, but"
+                    f" got: `gligen_phrases` {len(gligen_phrases)}, `gligen_boxes` {len(gligen_boxes)}, `num_frames` {num_frames}"
+                )
+            else:
+                for frame_index, (gligen_phrases_frame, gligen_boxes_frame) in enumerate(zip(gligen_phrases, gligen_boxes)):
+                    if len(gligen_phrases_frame) != len(gligen_boxes_frame):
+                        raise ValueError(
+                            "length of `gligen_phrases` and `gligen_boxes` has to be same, but"
+                            f" got: `gligen_phrases` {len(gligen_phrases_frame)} != `gligen_boxes` {len(gligen_boxes_frame)} at frame {frame_index}"
+                        )
 
     def prepare_latents(
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, latents=None
@@ -490,6 +509,11 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    def enable_fuser(self, enabled=True):
+        for module in self.unet.modules():
+            if type(module) is GatedSelfAttentionDense:
+                module.enabled = enabled
+    
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_freeu
     def enable_freeu(self, s1: float, s2: float, b1: float, b2: float):
         r"""Enables the FreeU mechanism as in https://arxiv.org/abs/2309.11497.
@@ -528,6 +552,9 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
         num_frames: int = 16,
         num_inference_steps: int = 50,
         guidance_scale: float = 9.0,
+        gligen_scheduled_sampling_beta: float = 0.3,
+        gligen_phrases: List[List[str]] = None,
+        gligen_boxes: List[List[List[float]]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -560,6 +587,17 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            gligen_phrases (`List[str]`):
+                The phrases to guide what to include in each of the regions defined by the corresponding
+                `gligen_boxes`. There should only be one phrase per bounding box.
+            gligen_boxes (`List[List[float]]`):
+                The bounding boxes that identify rectangular regions of the image that are going to be filled with the
+                content described by the corresponding `gligen_phrases`. Each rectangular box is defined as a
+                `List[float]` of 4 elements `[xmin, ymin, xmax, ymax]` where each value is between [0,1].
+            gligen_scheduled_sampling_beta (`float`, defaults to 0.3):
+                Scheduled Sampling factor from [GLIGEN: Open-Set Grounded Text-to-Image
+                Generation](https://arxiv.org/pdf/2301.07093.pdf). Scheduled Sampling factor is only varied for
+                scheduled sampling during inference for improved quality and controllability.
             negative_prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide what to not include in image generation. If not defined, you need to
                 pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
@@ -614,7 +652,8 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
-            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+            prompt, height, width, callback_steps, gligen_phrases,
+            gligen_boxes, negative_prompt, prompt_embeds, negative_prompt_embeds, num_frames
         )
 
         # 2. Define call parameters
@@ -670,6 +709,65 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
             latents,
         )
 
+        # 5.1 Prepare GLIGEN variables
+        if gligen_boxes:
+            max_objs = 30
+            boxes_all, text_embeddings_all, masks_all = [], [], []
+            for gligen_phrases_frame, gligen_boxes_frame in zip(gligen_phrases, gligen_boxes):
+                if len(gligen_boxes_frame) > max_objs:
+                    warnings.warn(
+                        f"More than {max_objs} objects found. Only first {max_objs} objects will be processed.",
+                        FutureWarning,
+                    )
+                    gligen_phrases_frame = gligen_phrases_frame[:max_objs]
+                    gligen_boxes_frame = gligen_boxes_frame[:max_objs]
+                    
+                # prepare batched input to the PositionNet (boxes, phrases, mask)
+                # Get tokens for phrases from pre-trained CLIPTokenizer
+                tokenizer_inputs = self.tokenizer(gligen_phrases_frame, padding=True, return_tensors="pt").to(device)
+                # For the token, we use the same pre-trained text encoder
+                # to obtain its text feature
+                _text_embeddings = self.text_encoder(**tokenizer_inputs).pooler_output
+                n_objs = len(gligen_boxes_frame)
+                # For each entity, described in phrases, is denoted with a bounding box,
+                # we represent the location information as (xmin,ymin,xmax,ymax)
+                boxes = torch.zeros(max_objs, 4, device=device, dtype=self.text_encoder.dtype)
+                boxes[:n_objs] = torch.tensor(gligen_boxes_frame)
+                text_embeddings = torch.zeros(
+                    max_objs, self.unet.cross_attention_dim, device=device, dtype=self.text_encoder.dtype
+                )
+                text_embeddings[:n_objs] = _text_embeddings
+                # Generate a mask for each object that is entity described by phrases
+                masks = torch.zeros(max_objs, device=device, dtype=self.text_encoder.dtype)
+                masks[:n_objs] = 1
+
+                repeat_batch = batch_size * num_images_per_prompt
+                boxes = boxes.unsqueeze(0).expand(repeat_batch, -1, -1).clone()
+                text_embeddings = text_embeddings.unsqueeze(0).expand(repeat_batch, -1, -1).clone()
+                masks = masks.unsqueeze(0).expand(repeat_batch, -1).clone()
+                if do_classifier_free_guidance:
+                    repeat_batch = repeat_batch * 2
+                    boxes = torch.cat([boxes] * 2)
+                    text_embeddings = torch.cat([text_embeddings] * 2)
+                    masks = torch.cat([masks] * 2)
+                    masks[: repeat_batch // 2] = 0
+                
+                boxes_all.append(boxes)
+                text_embeddings_all.append(text_embeddings)
+                masks_all.append(masks)
+            
+            if cross_attention_kwargs is None:
+                cross_attention_kwargs = {}
+            
+            # In `UNet3DConditionModel`, there is a permute and reshape to merge batch dimension and frame dimension.
+            boxes_all = torch.stack(boxes_all, dim=1).flatten(0, 1)
+            text_embeddings_all = torch.stack(text_embeddings_all, dim=1).flatten(0, 1)
+            masks_all = torch.stack(masks_all, dim=1).flatten(0, 1)
+            cross_attention_kwargs["gligen"] = {"boxes": boxes_all, "positive_embeddings": text_embeddings_all, "masks": masks_all}
+        
+        num_grounding_steps = int(gligen_scheduled_sampling_beta * len(timesteps))
+        self.enable_fuser(True)
+        
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -677,6 +775,12 @@ class TextToVideoSDPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lora
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                # Scheduled sampling
+                if i == num_grounding_steps:
+                    self.enable_fuser(False)
+                
+                assert latents.shape[1] == 4, f"latent channel mismatch: {latents.shape}"
+                
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
